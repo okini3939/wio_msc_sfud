@@ -22,10 +22,13 @@
 #define DISK_BLOCK_SIZE 512
 #include "ramdisk.h"
 #else
-#define DISK_BLOCK_NUM 1024
+#define DISK_BLOCK_NUM  (SPIFLASH.flashSize() / DISK_BLOCK_SIZE)
 #define DISK_BLOCK_SIZE SECTORSIZE
 #endif
 Adafruit_USBD_MSC usb_msc;
+
+static int read_lba = -1, read_size = 0;
+static int write_lba = -1, write_size = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -37,24 +40,19 @@ void setup() {
   }
 
   usb_msc.setID("Seeed", "MSC", "0.1");
-#if RAMDISK
   usb_msc.setCapacity(DISK_BLOCK_NUM, DISK_BLOCK_SIZE);
-#else
-  int block = SPIFLASH.flashSize() / DISK_BLOCK_SIZE;
-  usb_msc.setCapacity(block, DISK_BLOCK_SIZE);
-#endif
   usb_msc.setReadWriteCallback(msc_read_cb, msc_write_cb, msc_flush_cb);
   usb_msc.setUnitReady(true);
   usb_msc.begin();
 
-  while( !USBDevice.mounted() ) delay(1);
+//  while( !USBDevice.mounted() ) delay(1);
 
 }
 
 void loop() {
 
   if (digitalRead(WIO_5S_PRESS) == LOW) {
-    const sfud_flash *flash = sfud_get_device_table() + 0;
+    const sfud_flash *flash = sfud_get_device_table();
     uint8_t buf[16];
     for (int n = 0; n < 0x800; n ++) {
       if (sfud_read(flash, n * 512, sizeof(buf), buf) == SFUD_SUCCESS) {
@@ -98,7 +96,6 @@ void loop() {
     File fs = SPIFLASH.open("test.txt", "w");
     if (fs) {
       for (int i = 0; i < 4096; i ++) {
-//        fs.write((i >> 4) & 0xff);
         fs.print(i, HEX);
         if ((i & 0x0f) == 0x0f) {
           fs.println();
@@ -114,14 +111,16 @@ void loop() {
   delay(100);
 }
 
+
+// READ10 command
 int32_t msc_read_cb (uint32_t lba, void* buffer, uint32_t bufsize) {
 #if RAMDISK
   uint8_t const* addr = msc_disk[lba];
   memcpy(buffer, addr, bufsize);
 #else
-  static int read_lba = -1, read_size = 0;
   const sfud_flash *flash = sfud_get_device_table();
-  int addr = DISK_BLOCK_SIZE * lba + (512 * 0x1f8);
+  int addr = DISK_BLOCK_SIZE * lba + (512 * 0x01f8);
+  // 8blocks
   if (read_lba != lba) {
     read_lba = lba;
     read_size = bufsize;
@@ -130,6 +129,7 @@ int32_t msc_read_cb (uint32_t lba, void* buffer, uint32_t bufsize) {
     read_size += bufsize;
     if (read_size >= DISK_BLOCK_SIZE) read_size = 0;
   }
+
   if (sfud_read(flash, addr, bufsize, (uint8_t*)buffer) != SFUD_SUCCESS) {
     return -1;
   }
@@ -137,14 +137,15 @@ int32_t msc_read_cb (uint32_t lba, void* buffer, uint32_t bufsize) {
   return bufsize;
 }
 
+// WRITE10 command
 int32_t msc_write_cb (uint32_t lba, uint8_t* buffer, uint32_t bufsize) {
 #if RAMDISK
   uint8_t* addr = msc_disk[lba];
   memcpy(addr, buffer, bufsize);
 #else
-  static int write_lba = -1, write_size = 0;
   const sfud_flash *flash = sfud_get_device_table();
-  int addr = DISK_BLOCK_SIZE * lba + (512 * 0x1f8);
+  int addr = DISK_BLOCK_SIZE * lba + (512 * 0x01f8);
+  // 8blocks
   if (write_lba != lba) {
     write_lba = lba;
     write_size = bufsize;
@@ -153,15 +154,37 @@ int32_t msc_write_cb (uint32_t lba, uint8_t* buffer, uint32_t bufsize) {
     write_size += bufsize;
     if (write_size >= DISK_BLOCK_SIZE) write_size = 0;
   }
-  if (sfud_erase_write(flash, addr, bufsize, buffer) != SFUD_SUCCESS) {
-    return -1;
+
+  if (flash->chip.write_mode & SFUD_WM_PAGE_256B) {
+    if (write_size == bufsize) {
+      // erase 4KB block
+      if (sfud_erase(flash, addr, DISK_BLOCK_SIZE) != SFUD_SUCCESS) {
+        return -1;
+      }
+    }
+    // write 2 x 256bytes
+    if (sfud_write(flash, addr, 256, buffer) != SFUD_SUCCESS) {
+      return -1;
+    }
+    if (sfud_write(flash, addr + 256, 256, buffer + 256) != SFUD_SUCCESS) {
+      return -1;
+    }
+  } else
+  if (flash->chip.write_mode & SFUD_WM_AAI) {
+    if (sfud_erase_write(flash, addr, bufsize, buffer) != SFUD_SUCCESS) {
+      return -1;
+    }
   }
 #endif
   return bufsize;
 }
 
+// WRITE10 command is completed
 void msc_flush_cb (void) {
-  // nothing to do
+  read_lba = -1;
+  read_size = 0;
+  write_lba = -1;
+  write_size = 0;
 }
 
 
